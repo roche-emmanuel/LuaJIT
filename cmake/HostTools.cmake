@@ -88,8 +88,12 @@ if(_HOST_CC_IS_MSVC)
         ERROR_VARIABLE  _mlu_err
     )
 else()
+    set(_host_math_lib "")
+    if(NOT CMAKE_HOST_WIN32)
+        set(_host_math_lib "-lm")
+    endif()
     execute_process(
-        COMMAND "${_HOST_CC}" -O2 -o "${MINILUA_BIN}" "${MINILUA_SRC}" -lm
+        COMMAND "${_HOST_CC}" -O2 -o "${MINILUA_BIN}" "${MINILUA_SRC}" ${_host_math_lib}
         RESULT_VARIABLE _mlu_result
         OUTPUT_VARIABLE _mlu_out
         ERROR_VARIABLE  _mlu_err
@@ -472,7 +476,6 @@ message(STATUS "LuaJIT: compiling buildvm...")
 if(_HOST_CC_IS_MSVC)
     execute_process(
         COMMAND "${_HOST_CC}" /nologo /O2 /D_CRT_SECURE_NO_DEPRECATE
-                /D_BUILDVM_H
                 "/I${LUAJIT_SOURCE_DIR}"
                 "/I${CMAKE_CURRENT_BINARY_DIR}/host"
                 "/I${CMAKE_CURRENT_BINARY_DIR}"
@@ -485,12 +488,12 @@ if(_HOST_CC_IS_MSVC)
     )
 else()
     execute_process(
-        COMMAND "${_HOST_CC}" -O2 -D_BUILDVM_H
+        COMMAND "${_HOST_CC}" -O2
                 "-I${LUAJIT_SOURCE_DIR}"
                 "-I${CMAKE_CURRENT_BINARY_DIR}/host"
                 "-I${CMAKE_CURRENT_BINARY_DIR}"
                 ${BUILDVM_SRCS}
-                -o "${BUILDVM_BIN}" -lm
+                -o "${BUILDVM_BIN}" ${_host_math_lib}
         RESULT_VARIABLE _bvm_result
         OUTPUT_VARIABLE _bvm_out
         ERROR_VARIABLE  _bvm_err

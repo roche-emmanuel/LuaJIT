@@ -11,3 +11,5 @@
 *.swp
 .tags
 *.log
+dist/*
+compile_commands.json
