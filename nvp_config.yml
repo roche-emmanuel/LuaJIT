@@ -1,8 +1,8 @@
 scripts:
   lua_build:
     notify: false
-    help: Build LuaJIT project (in debug mode by default)
-    script: cmake build luajit -t Debug
+    help: Build nvLua project (in debug mode by default)
+    script: cmake build nvlua -t Debug
     cwd: ${PROJECT_ROOT_DIR}
   # nvl_setup:
   #   notify: false
@@ -11,7 +11,7 @@ scripts:
   #   cwd: ${PROJECT_ROOT_DIR}
 
 cmake_projects:
-  - name: LuaJIT
+  - name: nvLua
     root_dir: ${PROJECT_ROOT_DIR}
     install_dir: ${PROJECT_ROOT_DIR}/dist
     version: "26.6"
