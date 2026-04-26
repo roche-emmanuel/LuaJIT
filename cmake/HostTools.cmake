@@ -2,126 +2,177 @@
 # cmake/HostTools.cmake
 #
 # Builds minilua and buildvm using the HOST (native) compiler.
-# This must happen even during cross-compilation or Emscripten builds,
-# because these tools run on the build machine to generate headers.
+# Works on Windows (MSVC/clang-cl), Linux (GCC/Clang), macOS, and as the
+# host-tools stage of an Emscripten cross-build.
 #
-# Outputs (added to LUAJIT_GENERATED_HEADERS):
-#   host/buildvm_arch.h
-#   lj_bcdef.h  lj_ffdef.h  lj_libdef.h  lj_recdef.h  lj_folddef.h
-#   luajit.h    jit/vmdef.lua
-#   lj_vm.S  (or lj_vm.obj on Windows — the assembled VM for native builds)
+# Key design decisions:
+#   - Both tools are built at CMake CONFIGURE time (execute_process), not at
+#     build time, so all generated headers exist before any .c file compiles.
+#   - Sub-builds always use "NMake Makefiles" on Windows or "Unix Makefiles"
+#     elsewhere — never the parent generator — so they only need cl.exe/gcc
+#     on PATH, not Ninja/MSBuild.
+#   - Error output is captured and printed on failure so you can see exactly
+#     what went wrong.
 ##############################################################################
 
-# ── Locate a suitable host Lua or fall back to building minilua ─────────────
-# We always build minilua from source. It's small and guaranteed compatible.
-# (An existing Lua 5.1/5.2 + BitOp on PATH could be used, but this is simpler.)
+# ── Helper: pick a simple, always-available generator for sub-builds ─────────
+# We deliberately avoid the parent generator here. Ninja might not be on PATH
+# inside the sub-process on Windows; MSBuild multi-config adds complexity.
+# NMake / Unix Make are always present when the corresponding toolchain is.
+if(WIN32)
+    set(_HOST_GENERATOR "NMake Makefiles")
+else()
+    set(_HOST_GENERATOR "Unix Makefiles")
+endif()
 
+# ── Helper macro: run a sub-cmake configure+build, die with output on error ──
+macro(_host_subbuild NAME BUILD_DIR)
+    execute_process(
+        COMMAND "${CMAKE_COMMAND}"
+            -G "${_HOST_GENERATOR}"
+            ${ARGN}                           # caller passes -DVAR=val ... SRC_DIR
+        WORKING_DIRECTORY "${BUILD_DIR}"
+        RESULT_VARIABLE   _sub_cfg_result
+        OUTPUT_VARIABLE   _sub_cfg_out
+        ERROR_VARIABLE    _sub_cfg_err
+    )
+    if(NOT _sub_cfg_result EQUAL 0)
+        message(FATAL_ERROR
+            "${NAME} configure failed (exit ${_sub_cfg_result})\n"
+            "stdout:\n${_sub_cfg_out}\n"
+            "stderr:\n${_sub_cfg_err}")
+    endif()
+
+    execute_process(
+        COMMAND "${CMAKE_COMMAND}" --build "${BUILD_DIR}" --config Release
+        RESULT_VARIABLE  _sub_build_result
+        OUTPUT_VARIABLE  _sub_build_out
+        ERROR_VARIABLE   _sub_build_err
+    )
+    if(NOT _sub_build_result EQUAL 0)
+        message(FATAL_ERROR
+            "${NAME} build failed (exit ${_sub_build_result})\n"
+            "stdout:\n${_sub_build_out}\n"
+            "stderr:\n${_sub_build_err}")
+    endif()
+endmacro()
+
+##############################################################################
+# Step A: Build minilua
+##############################################################################
 set(MINILUA_SRC "${LUAJIT_SOURCE_DIR}/host/minilua.c")
-set(MINILUA_BIN "${CMAKE_CURRENT_BINARY_DIR}/host/minilua${CMAKE_HOST_EXECUTABLE_SUFFIX}")
 
-# Build minilua with the native C compiler via a sub-build so we get a true
-# host executable even when cross-compiling.
+# Executable suffix for the HOST (build machine), not the target.
+# On Windows this is ".exe"; elsewhere "".
+if(WIN32)
+    set(_host_exe_suffix ".exe")
+else()
+    set(_host_exe_suffix "")
+endif()
+
+set(MINILUA_BIN
+    "${CMAKE_CURRENT_BINARY_DIR}/host/minilua${_host_exe_suffix}")
+
 set(_minilua_build_dir "${CMAKE_CURRENT_BINARY_DIR}/host/minilua_build")
-
 file(MAKE_DIRECTORY "${_minilua_build_dir}")
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/host")
 
-# We write a tiny standalone CMakeLists for minilua so it uses
-# CMAKE_HOST_C_COMPILER, not the cross compiler.
+# Write the sub-project CMakeLists. Key differences from the old version:
+#   - math library linked only on non-Windows (libm doesn't exist on Windows)
+#   - OUTPUT_DIRECTORY set for all configs so Release/Debug both land in host/
 file(WRITE "${_minilua_build_dir}/CMakeLists.txt" [=[
 cmake_minimum_required(VERSION 3.20)
 project(minilua C)
 add_executable(minilua "${MINILUA_SRC}")
-target_link_libraries(minilua m)
-set_target_properties(minilua PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${OUT_DIR}"
-    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${OUT_DIR}"
-    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${OUT_DIR}"
-    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${OUT_DIR}"
-    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${OUT_DIR}"
-)
+if(NOT WIN32)
+    target_link_libraries(minilua PRIVATE m)
+endif()
+foreach(_cfg "" "_DEBUG" "_RELEASE" "_MINSIZEREL" "_RELWITHDEBINFO")
+    set_target_properties(minilua PROPERTIES
+        "RUNTIME_OUTPUT_DIRECTORY${_cfg}" "${OUT_DIR}")
+endforeach()
 ]=])
 
-# Configure and build minilua at CMake configure time so the binary is
-# available immediately for the subsequent add_custom_command calls.
-execute_process(
-    COMMAND "${CMAKE_COMMAND}"
-        -G "${CMAKE_GENERATOR}"
-        "-DMINILUA_SRC=${MINILUA_SRC}"
-        "-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/host"
-        "${_minilua_build_dir}"
-    WORKING_DIRECTORY "${_minilua_build_dir}"
-    RESULT_VARIABLE _cfg_result
-    OUTPUT_QUIET ERROR_QUIET
+message(STATUS "LuaJIT: configuring minilua...")
+_host_subbuild("minilua" "${_minilua_build_dir}"
+    "-DMINILUA_SRC=${MINILUA_SRC}"
+    "-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/host"
+    "${_minilua_build_dir}"
 )
-if(NOT _cfg_result EQUAL 0)
-    message(FATAL_ERROR "minilua configure step failed (exit ${_cfg_result})")
-endif()
-
-execute_process(
-    COMMAND "${CMAKE_COMMAND}" --build "${_minilua_build_dir}" --config Release
-    RESULT_VARIABLE _build_result
-    OUTPUT_QUIET ERROR_QUIET
-)
-if(NOT _build_result EQUAL 0)
-    message(FATAL_ERROR "minilua build step failed (exit ${_build_result})")
-endif()
 
 if(NOT EXISTS "${MINILUA_BIN}")
-    message(FATAL_ERROR "minilua binary not found at ${MINILUA_BIN}")
+    message(FATAL_ERROR
+        "minilua binary expected at:\n  ${MINILUA_BIN}\nbut was not found "
+        "after a successful build. Check RUNTIME_OUTPUT_DIRECTORY logic.")
 endif()
-message(STATUS "LuaJIT: minilua built at ${MINILUA_BIN}")
+message(STATUS "LuaJIT: minilua → ${MINILUA_BIN}")
 
-# ── DynASM invocation helper ─────────────────────────────────────────────────
+##############################################################################
+# Step B: Probe target architecture via preprocessor
+##############################################################################
 set(DYNASM "${LUAJIT_DYNASM_DIR}/dynasm.lua")
-
-# Probe the TARGET architecture by running the preprocessor on lj_arch.h.
-# We collect the #define output and match against known LJ_TARGET_* tokens.
-# This mirrors exactly what src/Makefile does with $(TARGET_TESTARCH).
-#
-# When cross-compiling, CMAKE_C_COMPILER is the cross compiler, so the probe
-# runs against the target headers. That is correct.
 
 set(_arch_probe_src "${CMAKE_CURRENT_BINARY_DIR}/host/_arch_probe.c")
 file(WRITE "${_arch_probe_src}" "#include \"lj_arch.h\"\n")
 
-execute_process(
-    COMMAND "${CMAKE_C_COMPILER}" -E -dM
-        -I "${LUAJIT_SOURCE_DIR}"
-        "${_arch_probe_src}"
-    OUTPUT_VARIABLE _arch_defines
-    ERROR_QUIET
-    RESULT_VARIABLE _probe_result
-)
-if(NOT _probe_result EQUAL 0)
-    # Emscripten needs extra help — retry without -dM using compile flags
+# MSVC uses /EP /P for preprocessing; GCC/Clang use -E -dM.
+if(MSVC)
+    # /EP: preprocess to stdout, no line markers
+    # /D_BUILDVM_H: suppress the target-arch checks that require a target link
     execute_process(
-        COMMAND "${CMAKE_C_COMPILER}" -E
-            -I "${LUAJIT_SOURCE_DIR}"
+        COMMAND "${CMAKE_C_COMPILER}"
+            /nologo /EP
+            "/I${LUAJIT_SOURCE_DIR}"
+            /D_BUILDVM_H
             "${_arch_probe_src}"
         OUTPUT_VARIABLE _arch_defines
         ERROR_QUIET
+        RESULT_VARIABLE _probe_result
     )
+else()
+    execute_process(
+        COMMAND "${CMAKE_C_COMPILER}" -E -dM
+            "-I${LUAJIT_SOURCE_DIR}"
+            "${_arch_probe_src}"
+        OUTPUT_VARIABLE _arch_defines
+        ERROR_QUIET
+        RESULT_VARIABLE _probe_result
+    )
+    if(NOT _probe_result EQUAL 0)
+        # Some cross-compilers don't support -dM; fall back to plain -E
+        execute_process(
+            COMMAND "${CMAKE_C_COMPILER}" -E
+                "-I${LUAJIT_SOURCE_DIR}"
+                "${_arch_probe_src}"
+            OUTPUT_VARIABLE _arch_defines
+            ERROR_QUIET
+            RESULT_VARIABLE _probe_result
+        )
+    endif()
 endif()
 
-# ── Determine DASM arch and flags from probe output ──────────────────────────
+##############################################################################
+# Step C: Determine DASM arch + flags from probe output
+##############################################################################
 set(DASM_AFLAGS "")
-set(DASM_ARCH "")
+set(DASM_ARCH   "")
 
 if(LUAJIT_TARGET_WASM)
-    # WASM: we use the x86 .dasc file to generate the bcdef/ffdef/etc headers
-    # (the VM asm itself won't be linked — lj_vm_wasm.c takes its place).
-    # We must tell DynASM to generate with JIT and FFI enabled so all the
-    # header enumerations are populated.
+    # WASM: use x86 .dasc just to generate the header enumerations.
+    # The assembled VM itself is replaced by lj_vm_wasm.c.
     set(DASM_ARCH "x86")
-    list(APPEND DASM_AFLAGS -D P64 -D JIT -D FFI -D FPU -D HFABI -D ENDIAN_LE -D VER=0)
     set(LUAJIT_DASM_ARCH_NAME "wasm32")
+    list(APPEND DASM_AFLAGS -D P64 -D JIT -D FFI -D FPU -D HFABI -D ENDIAN_LE -D VER=0)
 else()
-    # Native: detect from probe
+    # x86 must be checked BEFORE x64 because x64 probe also defines
+    # LJ_TARGET_X86 on some compilers — check the more specific one first.
     if(_arch_defines MATCHES "LJ_TARGET_X64 1")
-        set(DASM_ARCH "x64")
         set(LUAJIT_DASM_ARCH_NAME "x64")
-        if(NOT _arch_defines MATCHES "LJ_FR2 1")
-            set(DASM_ARCH "x86")  # x64 without GC64 uses vm_x86.dasc
+        # GC64 mode uses vm_x64.dasc; legacy (non-GC64) uses vm_x86.dasc
+        if(_arch_defines MATCHES "LJ_FR2 1")
+            set(DASM_ARCH "x64")
+        else()
+            set(DASM_ARCH "x86")
         endif()
     elseif(_arch_defines MATCHES "LJ_TARGET_X86 1")
         set(DASM_ARCH "x86")
@@ -129,15 +180,9 @@ else()
     elseif(_arch_defines MATCHES "LJ_TARGET_ARM64 1")
         set(DASM_ARCH "arm64")
         set(LUAJIT_DASM_ARCH_NAME "arm64")
-        if(_arch_defines MATCHES "__AARCH64EB__")
-            list(APPEND DASM_AFLAGS -D ENDIAN_BE)
-        else()
-            list(APPEND DASM_AFLAGS -D ENDIAN_LE)
-        endif()
     elseif(_arch_defines MATCHES "LJ_TARGET_ARM 1")
         set(DASM_ARCH "arm")
         set(LUAJIT_DASM_ARCH_NAME "arm")
-        list(APPEND DASM_AFLAGS -D ENDIAN_LE)
     elseif(_arch_defines MATCHES "LJ_TARGET_PPC 1")
         set(DASM_ARCH "ppc")
         set(LUAJIT_DASM_ARCH_NAME "ppc")
@@ -149,19 +194,22 @@ else()
         set(LUAJIT_DASM_ARCH_NAME "mips")
     else()
         message(FATAL_ERROR
-            "LuaJIT: could not detect target architecture from preprocessor output.\n"
-            "If cross-compiling, make sure CMAKE_C_COMPILER is set to the cross compiler.")
+            "LuaJIT: cannot detect target architecture.\n"
+            "Preprocessor output was:\n${_arch_defines}\n"
+            "If cross-compiling ensure CMAKE_C_COMPILER is the cross compiler.")
     endif()
 
-    # Common DASM flags derived from arch probe
+    # Endianness
     if(_arch_defines MATCHES "LJ_LE 1")
         list(APPEND DASM_AFLAGS -D ENDIAN_LE)
     else()
         list(APPEND DASM_AFLAGS -D ENDIAN_BE)
     endif()
+    # Pointer size
     if(_arch_defines MATCHES "LJ_ARCH_BITS 64")
         list(APPEND DASM_AFLAGS -D P64)
     endif()
+    # Feature flags
     if(_arch_defines MATCHES "LJ_HASJIT 1")
         list(APPEND DASM_AFLAGS -D JIT)
     endif()
@@ -177,12 +225,11 @@ else()
     if(NOT _arch_defines MATCHES "LJ_ABI_SOFTFP 1")
         list(APPEND DASM_AFLAGS -D HFABI)
     endif()
-    if(_arch_defines MATCHES "LJ_TARGET_MIPSR6 1")
-        list(APPEND DASM_AFLAGS -D MIPSR6)
-    endif()
+    # Platform
     if(WIN32 OR _arch_defines MATCHES "LJ_TARGET_WINDOWS 1")
         list(APPEND DASM_AFLAGS -D WIN)
     endif()
+    # ABI flags
     if(_arch_defines MATCHES "LJ_ABI_PAUTH 1")
         list(APPEND DASM_AFLAGS -D PAUTH)
     endif()
@@ -192,39 +239,68 @@ else()
     if(_arch_defines MATCHES "LJ_ABI_SHADOW_STACK 1")
         list(APPEND DASM_AFLAGS -D SHADOW_STACK)
     endif()
-
-    # Arch version
-    string(REGEX MATCH "LJ_ARCH_VERSION ([0-9]+)" _ver_match "${_arch_defines}")
-    if(_ver_match)
-        list(APPEND DASM_AFLAGS -D "VER=${CMAKE_MATCH_1}")
-    else()
-        list(APPEND DASM_AFLAGS -D VER=0)
+    # MIPS R6
+    if(_arch_defines MATCHES "LJ_TARGET_MIPSR6 1")
+        list(APPEND DASM_AFLAGS -D MIPSR6)
     endif()
-
     # ARM iOS
     if(DASM_ARCH STREQUAL "arm" AND APPLE AND IOS)
         list(APPEND DASM_AFLAGS -D IOS)
     endif()
+    # PPC extras
+    if(DASM_ARCH STREQUAL "ppc")
+        if(_arch_defines MATCHES "LJ_ARCH_SQRT 1")
+            list(APPEND DASM_AFLAGS -D SQRT)
+        endif()
+        if(_arch_defines MATCHES "LJ_ARCH_ROUND 1")
+            list(APPEND DASM_AFLAGS -D ROUND)
+        endif()
+        if(_arch_defines MATCHES "LJ_ARCH_PPC32ON64 1")
+            list(APPEND DASM_AFLAGS -D GPR64)
+        endif()
+    endif()
+    # Arch version number
+    string(REGEX MATCH "#define LJ_ARCH_VERSION ([0-9]+)" _ver_match "${_arch_defines}")
+    if(CMAKE_MATCH_1)
+        list(APPEND DASM_AFLAGS -D "VER=${CMAKE_MATCH_1}")
+    else()
+        list(APPEND DASM_AFLAGS -D VER=0)
+    endif()
 endif()
 
-message(STATUS "LuaJIT: DASM_ARCH=${DASM_ARCH}, DASM_AFLAGS=${DASM_AFLAGS}")
+message(STATUS "LuaJIT: arch=${LUAJIT_DASM_ARCH_NAME}  dasm_arch=${DASM_ARCH}")
+message(STATUS "LuaJIT: DASM_AFLAGS=${DASM_AFLAGS}")
 
 set(DASM_DASC "${LUAJIT_SOURCE_DIR}/vm_${DASM_ARCH}.dasc")
+if(NOT EXISTS "${DASM_DASC}")
+    message(FATAL_ERROR "DynASM source not found: ${DASM_DASC}")
+endif()
 
-# ── Step 1: generate host/buildvm_arch.h via DynASM ─────────────────────────
+##############################################################################
+# Step D: Run DynASM → host/buildvm_arch.h   (at configure time)
+##############################################################################
 set(BUILDVM_ARCH_H "${CMAKE_CURRENT_BINARY_DIR}/host/buildvm_arch.h")
-file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/host")
 
-add_custom_command(
-    OUTPUT  "${BUILDVM_ARCH_H}"
-    COMMAND "${MINILUA_BIN}" "${DYNASM}" ${DASM_AFLAGS}
+message(STATUS "LuaJIT: running DynASM → buildvm_arch.h ...")
+execute_process(
+    COMMAND "${MINILUA_BIN}" "${DYNASM}"
+            ${DASM_AFLAGS}
             -o "${BUILDVM_ARCH_H}"
             "${DASM_DASC}"
-    DEPENDS "${DASM_DASC}" "${DYNASM}"
-    COMMENT "LuaJIT: DynASM → buildvm_arch.h"
+    RESULT_VARIABLE _dasm_result
+    OUTPUT_VARIABLE _dasm_out
+    ERROR_VARIABLE  _dasm_err
 )
+if(NOT _dasm_result EQUAL 0)
+    message(FATAL_ERROR
+        "DynASM failed (exit ${_dasm_result})\n"
+        "stdout:\n${_dasm_out}\nstderr:\n${_dasm_err}")
+endif()
+message(STATUS "LuaJIT: buildvm_arch.h generated")
 
-# ── Step 2: build buildvm (host native, reads buildvm_arch.h) ────────────────
+##############################################################################
+# Step E: Build buildvm   (at configure time)
+##############################################################################
 set(BUILDVM_SRCS
     "${LUAJIT_SOURCE_DIR}/host/buildvm.c"
     "${LUAJIT_SOURCE_DIR}/host/buildvm_asm.c"
@@ -232,73 +308,42 @@ set(BUILDVM_SRCS
     "${LUAJIT_SOURCE_DIR}/host/buildvm_lib.c"
     "${LUAJIT_SOURCE_DIR}/host/buildvm_fold.c"
 )
-set(BUILDVM_BIN "${CMAKE_CURRENT_BINARY_DIR}/host/buildvm${CMAKE_HOST_EXECUTABLE_SUFFIX}")
+set(BUILDVM_BIN
+    "${CMAKE_CURRENT_BINARY_DIR}/host/buildvm${_host_exe_suffix}")
 
 set(_buildvm_build_dir "${CMAKE_CURRENT_BINARY_DIR}/host/buildvm_build")
 file(MAKE_DIRECTORY "${_buildvm_build_dir}")
 
-# Write a self-contained CMakeLists for buildvm
 file(WRITE "${_buildvm_build_dir}/CMakeLists.txt" [=[
 cmake_minimum_required(VERSION 3.20)
 project(buildvm C)
 add_executable(buildvm ${BUILDVM_SRCS})
 target_include_directories(buildvm PRIVATE "${LUAJIT_SRC_DIR}" "${ARCH_H_DIR}")
 target_compile_definitions(buildvm PRIVATE _BUILDVM_H)
-set_target_properties(buildvm PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${OUT_DIR}"
-    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${OUT_DIR}"
-    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${OUT_DIR}"
-    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${OUT_DIR}"
-    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${OUT_DIR}"
-)
+foreach(_cfg "" "_DEBUG" "_RELEASE" "_MINSIZEREL" "_RELWITHDEBINFO")
+    set_target_properties(buildvm PROPERTIES
+        "RUNTIME_OUTPUT_DIRECTORY${_cfg}" "${OUT_DIR}")
+endforeach()
 ]=])
 
-# We regenerate buildvm only when buildvm_arch.h changes.
-# Because buildvm depends on the generated header we cannot use
-# add_custom_command + add_custom_target alone for this; instead we use
-# a second configure-time sub-build triggered by a cmake script that
-# checks the timestamp of buildvm_arch.h.
-
-# Instead, we model it as a cmake -P script that runs at build time.
-file(WRITE "${_buildvm_build_dir}/build_buildvm.cmake" "
-execute_process(
-    COMMAND \"\${CMAKE_COMMAND}\"
-        -G \"\${GENERATOR}\"
-        \"-DBUILDVM_SRCS=${BUILDVM_SRCS}\"
-        \"-DLUAJIT_SRC_DIR=${LUAJIT_SOURCE_DIR}\"
-        \"-DARCH_H_DIR=${CMAKE_CURRENT_BINARY_DIR}/host\"
-        \"-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/host\"
-        \"${_buildvm_build_dir}\"
-    RESULT_VARIABLE r
+message(STATUS "LuaJIT: configuring buildvm...")
+_host_subbuild("buildvm" "${_buildvm_build_dir}"
+    "-DBUILDVM_SRCS=${BUILDVM_SRCS}"
+    "-DLUAJIT_SRC_DIR=${LUAJIT_SOURCE_DIR}"
+    "-DARCH_H_DIR=${CMAKE_CURRENT_BINARY_DIR}/host"
+    "-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/host"
+    "${_buildvm_build_dir}"
 )
-if(NOT r EQUAL 0)
-    message(FATAL_ERROR \"buildvm configure failed\")
+
+if(NOT EXISTS "${BUILDVM_BIN}")
+    message(FATAL_ERROR
+        "buildvm binary expected at:\n  ${BUILDVM_BIN}\nbut was not found.")
 endif()
-execute_process(
-    COMMAND \"\${CMAKE_COMMAND}\" --build \"${_buildvm_build_dir}\" --config Release
-    RESULT_VARIABLE r
-)
-if(NOT r EQUAL 0)
-    message(FATAL_ERROR \"buildvm build failed\")
-endif()
-")
+message(STATUS "LuaJIT: buildvm → ${BUILDVM_BIN}")
 
-add_custom_command(
-    OUTPUT  "${BUILDVM_BIN}"
-    COMMAND "${CMAKE_COMMAND}"
-            -DCMAKE_COMMAND=${CMAKE_COMMAND}
-            -DGENERATOR=${CMAKE_GENERATOR}
-            -P "${_buildvm_build_dir}/build_buildvm.cmake"
-    DEPENDS "${BUILDVM_ARCH_H}" ${BUILDVM_SRCS}
-    COMMENT "LuaJIT: building host buildvm"
-)
-
-add_custom_target(luajit_buildvm DEPENDS "${BUILDVM_BIN}")
-
-# ── Step 3: generate C headers via buildvm ───────────────────────────────────
-# These are: lj_bcdef.h  lj_ffdef.h  lj_libdef.h  lj_recdef.h  lj_folddef.h
-# Plus: jit/vmdef.lua and luajit.h (version header)
-
+##############################################################################
+# Step F: Run buildvm to generate all headers   (at configure time)
+##############################################################################
 set(LJLIB_C
     "${LUAJIT_SOURCE_DIR}/lib_base.c"
     "${LUAJIT_SOURCE_DIR}/lib_math.c"
@@ -314,46 +359,58 @@ set(LJLIB_C
     "${LUAJIT_SOURCE_DIR}/lib_buffer.c"
 )
 
-macro(buildvm_generate MODE OUTPUT)
-    set(_extra_deps "${ARGN}")
-    add_custom_command(
-        OUTPUT  "${OUTPUT}"
-        COMMAND "${BUILDVM_BIN}" -m "${MODE}" -o "${OUTPUT}" ${_extra_deps}
-        DEPENDS "${BUILDVM_BIN}" ${_extra_deps}
-        COMMENT "LuaJIT: buildvm -m ${MODE} → ${OUTPUT}"
+# Helper: run buildvm -m MODE -o OUTPUT [extra args], die on error
+macro(_buildvm_run MODE OUTPUT)
+    execute_process(
+        COMMAND "${BUILDVM_BIN}" -m "${MODE}" -o "${OUTPUT}" ${ARGN}
+        RESULT_VARIABLE _bvm_result
+        OUTPUT_VARIABLE _bvm_out
+        ERROR_VARIABLE  _bvm_err
     )
+    if(NOT _bvm_result EQUAL 0)
+        message(FATAL_ERROR
+            "buildvm -m ${MODE} failed (exit ${_bvm_result})\n"
+            "stdout:\n${_bvm_out}\nstderr:\n${_bvm_err}")
+    endif()
+    message(STATUS "LuaJIT: generated ${OUTPUT}")
 endmacro()
 
-set(LJ_BCDEF_H    "${CMAKE_CURRENT_BINARY_DIR}/lj_bcdef.h")
-set(LJ_FFDEF_H    "${CMAKE_CURRENT_BINARY_DIR}/lj_ffdef.h")
-set(LJ_LIBDEF_H   "${CMAKE_CURRENT_BINARY_DIR}/lj_libdef.h")
-set(LJ_RECDEF_H   "${CMAKE_CURRENT_BINARY_DIR}/lj_recdef.h")
-set(LJ_FOLDDEF_H  "${CMAKE_CURRENT_BINARY_DIR}/lj_folddef.h")
-set(LJ_VMDEF_LUA  "${CMAKE_CURRENT_BINARY_DIR}/jit/vmdef.lua")
+set(LJ_BCDEF_H   "${CMAKE_CURRENT_BINARY_DIR}/lj_bcdef.h")
+set(LJ_FFDEF_H   "${CMAKE_CURRENT_BINARY_DIR}/lj_ffdef.h")
+set(LJ_LIBDEF_H  "${CMAKE_CURRENT_BINARY_DIR}/lj_libdef.h")
+set(LJ_RECDEF_H  "${CMAKE_CURRENT_BINARY_DIR}/lj_recdef.h")
+set(LJ_FOLDDEF_H "${CMAKE_CURRENT_BINARY_DIR}/lj_folddef.h")
+set(LJ_VMDEF_LUA "${CMAKE_CURRENT_BINARY_DIR}/jit/vmdef.lua")
+set(LJ_LUAJIT_H  "${CMAKE_CURRENT_BINARY_DIR}/luajit.h")
 
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/jit")
 
-buildvm_generate(bcdef   "${LJ_BCDEF_H}"   ${LJLIB_C})
-buildvm_generate(ffdef   "${LJ_FFDEF_H}"   ${LJLIB_C})
-buildvm_generate(libdef  "${LJ_LIBDEF_H}"  ${LJLIB_C})
-buildvm_generate(recdef  "${LJ_RECDEF_H}"  ${LJLIB_C})
-buildvm_generate(vmdef   "${LJ_VMDEF_LUA}" ${LJLIB_C})
-buildvm_generate(folddef "${LJ_FOLDDEF_H}" "${LUAJIT_SOURCE_DIR}/lj_opt_fold.c")
+_buildvm_run(bcdef   "${LJ_BCDEF_H}"   ${LJLIB_C})
+_buildvm_run(ffdef   "${LJ_FFDEF_H}"   ${LJLIB_C})
+_buildvm_run(libdef  "${LJ_LIBDEF_H}"  ${LJLIB_C})
+_buildvm_run(recdef  "${LJ_RECDEF_H}"  ${LJLIB_C})
+_buildvm_run(vmdef   "${LJ_VMDEF_LUA}" ${LJLIB_C})
+_buildvm_run(folddef "${LJ_FOLDDEF_H}"
+    "${LUAJIT_SOURCE_DIR}/lj_opt_fold.c")
 
-# ── Step 4: luajit.h (version header) ────────────────────────────────────────
-set(LJ_LUAJIT_H "${CMAKE_CURRENT_BINARY_DIR}/luajit.h")
-
-add_custom_command(
-    OUTPUT  "${LJ_LUAJIT_H}"
+# luajit.h version header
+execute_process(
     COMMAND "${MINILUA_BIN}" "${LUAJIT_SOURCE_DIR}/host/genversion.lua"
     WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-    DEPENDS "${LUAJIT_SOURCE_DIR}/host/genversion.lua"
-            "${LUAJIT_SOURCE_DIR}/luajit_rolling.h"
-    COMMENT "LuaJIT: generating luajit.h"
+    RESULT_VARIABLE _ver_result
+    OUTPUT_VARIABLE _ver_out
+    ERROR_VARIABLE  _ver_err
 )
+if(NOT _ver_result EQUAL 0)
+    message(FATAL_ERROR
+        "genversion.lua failed (exit ${_ver_result})\n"
+        "stdout:\n${_ver_out}\nstderr:\n${_ver_err}")
+endif()
+message(STATUS "LuaJIT: generated luajit.h")
 
-# ── Step 5: lj_vm.S / lj_vm.obj (native builds only) ────────────────────────
-# For WASM this step is skipped; lj_vm_wasm.c fills the same role.
+##############################################################################
+# Step G: lj_vm.S / lj_vm.obj (native only, also at configure time)
+##############################################################################
 if(NOT LUAJIT_TARGET_WASM)
     if(WIN32)
         set(LJVM_MODE "peobj")
@@ -366,19 +423,15 @@ if(NOT LUAJIT_TARGET_WASM)
         set(LJVM_OUT  "${CMAKE_CURRENT_BINARY_DIR}/lj_vm.S")
     endif()
 
-    add_custom_command(
-        OUTPUT  "${LJVM_OUT}"
-        COMMAND "${BUILDVM_BIN}" -m "${LJVM_MODE}" -o "${LJVM_OUT}"
-        DEPENDS "${BUILDVM_BIN}"
-        COMMENT "LuaJIT: buildvm -m ${LJVM_MODE} → lj_vm"
-    )
+    _buildvm_run("${LJVM_MODE}" "${LJVM_OUT}")
     set(LUAJIT_VM_SOURCE "${LJVM_OUT}")
 else()
-    # WASM: no assembled VM; lj_vm_wasm.c is listed in the source file set.
     set(LUAJIT_VM_SOURCE "")
 endif()
 
-# ── Aggregate all generated headers into one target ──────────────────────────
+##############################################################################
+# Expose a dummy target so other targets can depend on "headers done"
+##############################################################################
 set(LUAJIT_GENERATED_HEADERS
     "${LJ_BCDEF_H}"
     "${LJ_FFDEF_H}"
@@ -389,6 +442,8 @@ set(LUAJIT_GENERATED_HEADERS
     "${BUILDVM_ARCH_H}"
 )
 
+# All headers already exist on disk at this point (generated above).
+# The custom target is kept for add_dependencies() compatibility.
 add_custom_target(luajit_headers
-    DEPENDS ${LUAJIT_GENERATED_HEADERS} "${LJ_VMDEF_LUA}"
+    COMMENT "LuaJIT: all generated headers are up to date"
 )

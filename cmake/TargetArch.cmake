@@ -1,11 +1,11 @@
 ##############################################################################
 # cmake/TargetArch.cmake
 #
-# Sets up compiler flags and definitions for the target platform.
-# Reads DASM_ARCH / _arch_defines from HostTools.cmake (already included).
+# Translates the detected architecture + user options into compiler flags,
+# compile definitions, and link settings for the target library/executable.
 ##############################################################################
 
-# ── Feature flags → compile definitions ──────────────────────────────────────
+# ── Feature-flag compile definitions ─────────────────────────────────────────
 set(LUAJIT_TARGET_DEFS "")
 
 if(LUAJIT_ENABLE_LUA52COMPAT)
@@ -35,7 +35,6 @@ elseif(LUAJIT_NUMMODE STREQUAL "2")
     list(APPEND LUAJIT_TARGET_DEFS LUAJIT_NUMMODE=2)
 endif()
 
-# WASM-specific
 if(LUAJIT_TARGET_WASM)
     list(APPEND LUAJIT_TARGET_DEFS
         LUAJIT_TARGET=LUAJIT_ARCH_WASM
@@ -48,29 +47,32 @@ endif()
 # ── Compiler flags ────────────────────────────────────────────────────────────
 set(LUAJIT_COMPILE_OPTIONS "")
 
-if(LUAJIT_TARGET_WASM)
-    # Emscripten: disable frame pointer omission warnings, use -O2
-    list(APPEND LUAJIT_COMPILE_OPTIONS -O2)
-elseif(MSVC)
+if(MSVC)
     list(APPEND LUAJIT_COMPILE_OPTIONS
-        /O2 /W3
+        /O2
+        /W3
         /D_CRT_SECURE_NO_DEPRECATE
         /D_CRT_STDIO_INLINE
+        # Suppress a few noisy MSVC warnings that LuaJIT intentionally triggers
+        /wd4244   # conversion, possible loss of data
+        /wd4267   # size_t → int conversion
+        /wd4146   # unary minus on unsigned
+        /wd4334   # 32-bit shift result implicitly converted to 64 bits
     )
-    if(CMAKE_C_COMPILER_ID STREQUAL "Clang")
-        # clang-cl: nothing extra needed
-    else()
-        # MSVC: use /MT or /MD based on standard CMake mechanism
-        # (CMAKE_MSVC_RUNTIME_LIBRARY handles this in CMake 3.15+)
-    endif()
+elseif(LUAJIT_TARGET_WASM)
+    list(APPEND LUAJIT_COMPILE_OPTIONS -O2)
 else()
     list(APPEND LUAJIT_COMPILE_OPTIONS
         -O2
         -fomit-frame-pointer
         -Wall
-        -fno-stack-protector
     )
-    # Arch-specific
+    # -fno-stack-protector only if the compiler supports it
+    include(CheckCCompilerFlag)
+    check_c_compiler_flag(-fno-stack-protector _has_no_sp)
+    if(_has_no_sp)
+        list(APPEND LUAJIT_COMPILE_OPTIONS -fno-stack-protector)
+    endif()
     if(LUAJIT_DASM_ARCH_NAME STREQUAL "x86")
         list(APPEND LUAJIT_COMPILE_OPTIONS
             -march=i686 -msse -msse2 -mfpmath=sse)
@@ -79,27 +81,25 @@ endif()
 
 # ── Link libraries ────────────────────────────────────────────────────────────
 set(LUAJIT_LINK_LIBS "")
-if(NOT LUAJIT_TARGET_WASM AND NOT WIN32)
+if(NOT WIN32 AND NOT LUAJIT_TARGET_WASM)
     list(APPEND LUAJIT_LINK_LIBS m)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         list(APPEND LUAJIT_LINK_LIBS dl)
     endif()
 endif()
 
-# ── Platform-specific linker flags ────────────────────────────────────────────
-set(LUAJIT_EXE_LINKER_FLAGS "")
+# ── Linker flags ──────────────────────────────────────────────────────────────
+set(LUAJIT_EXE_LINKER_FLAGS    "")
 set(LUAJIT_SHARED_LINKER_FLAGS "")
 
 if(LUAJIT_TARGET_WASM)
-    # These get set on the target in RuntimeLib.cmake
     set(LUAJIT_EMSCRIPTEN_LINK_FLAGS
-        -sALLOW_MEMORY_GROWTH=1
-        -sEXPORTED_FUNCTIONS=['_lua_newstate','_lua_close','_luaL_newstate','_luaL_openlibs','_lua_pcall','_luaL_loadbuffer','_lua_tolstring','_lua_settop','_lua_gettop','_lua_pushstring','_lua_pushnumber','_lua_pushinteger','_lua_pushboolean','_lua_pushnil','_luaL_dostring']
-        -sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','UTF8ToString','allocate','ALLOC_NORMAL']
-        -sMODULARIZE=1
-        -sEXPORT_NAME=LuaJIT
-        -sASSERTIONS=1
-        -sNODERAWFS=0
+        "SHELL:-sALLOW_MEMORY_GROWTH=1"
+        "SHELL:-sEXPORTED_FUNCTIONS=['_lua_newstate','_lua_close','_luaL_newstate','_luaL_openlibs','_lua_pcall','_luaL_loadbuffer','_lua_tolstring','_lua_settop','_lua_gettop','_lua_pushstring','_lua_pushnumber','_lua_pushinteger','_lua_pushboolean','_lua_pushnil','_luaL_dostring']"
+        "SHELL:-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','UTF8ToString','allocate','ALLOC_NORMAL']"
+        "SHELL:-sMODULARIZE=1"
+        "SHELL:-sEXPORT_NAME=LuaJIT"
+        "SHELL:-sASSERTIONS=1"
     )
 elseif(APPLE)
     set(LUAJIT_SHARED_LINKER_FLAGS
@@ -108,5 +108,5 @@ elseif(NOT WIN32)
     set(LUAJIT_EXE_LINKER_FLAGS "-Wl,-E")
 endif()
 
-message(STATUS "LuaJIT: target defs: ${LUAJIT_TARGET_DEFS}")
-message(STATUS "LuaJIT: link libs:   ${LUAJIT_LINK_LIBS}")
+message(STATUS "LuaJIT: compile defs:  ${LUAJIT_TARGET_DEFS}")
+message(STATUS "LuaJIT: link libs:     ${LUAJIT_LINK_LIBS}")
