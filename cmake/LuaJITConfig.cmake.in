@@ -1,0 +1,14 @@
+@PACKAGE_INIT@
+
+include("${CMAKE_CURRENT_LIST_DIR}/LuaJITTargets.cmake" OPTIONAL)
+
+# Provide LUAJIT_LIBRARIES / LUAJIT_INCLUDE_DIRS for legacy find_package users
+if(TARGET luajit::static)
+    set(LUAJIT_LIBRARIES    luajit::static)
+elseif(TARGET luajit::shared)
+    set(LUAJIT_LIBRARIES    luajit::shared)
+endif()
+
+get_target_property(LUAJIT_INCLUDE_DIRS luajit::luajit INTERFACE_INCLUDE_DIRECTORIES)
+
+check_required_components(LuaJIT)

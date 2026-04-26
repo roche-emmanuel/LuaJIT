@@ -1,0 +1,29 @@
+scripts:
+  lua_build:
+    notify: false
+    help: Build LuaJIT project (in debug mode by default)
+    script: cmake build luajit -t Debug
+    cwd: ${PROJECT_ROOT_DIR}
+  # nvl_setup:
+  #   notify: false
+  #   help: Setup NervLand project
+  #   script: cmake setup nervland -g
+  #   cwd: ${PROJECT_ROOT_DIR}
+
+cmake_projects:
+  - name: LuaJIT
+    root_dir: ${PROJECT_ROOT_DIR}
+    install_dir: ${PROJECT_ROOT_DIR}/dist
+    version: "26.6"
+    prefix: lj
+
+    # defs:
+    #   NV_DAWN_VERSION: 250901
+    #   NV_USE_FFMPEG: 1
+
+    # dependencies:
+    #   FMT_DIR: fmt
+    #   OPENSSL_DIR: openssl
+    #   ZLIB_DIR: zlib
+    #   YAMLCPP_DIR: yamlcpp
+    #   CLIPPER2_DIR: clipper2
