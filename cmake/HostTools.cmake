@@ -1,120 +1,150 @@
 ##############################################################################
 # cmake/HostTools.cmake
 #
-# Builds minilua and buildvm using the HOST native compiler, even when the
-# parent build is cross-compiling (Emscripten, ARM, etc.).
+# Builds minilua and buildvm using the HOST native compiler (even when the
+# parent build is cross-compiling for Emscripten, ARM, etc.), then generates
+# all required headers for the LuaJIT build.
+#
+# Build steps (all at cmake configure time):
+#   A. Compile minilua
+#   B. Generate luajit_relver.txt (git) + luajit.h (genversion.lua)
+#   C. Probe target arch via preprocessor #pragma message
+#   D. Determine DynASM arch + flags
+#   E. Run DynASM → host/buildvm_arch.h
+#   F. Compile buildvm
+#   G. Run buildvm to generate lj_bcdef.h, lj_ffdef.h, …
+#   H. Run buildvm → lj_vm.S / lj_vm.obj (skipped for WASM)
 ##############################################################################
 
-# ── Find the host C compiler ──────────────────────────────────────────────────
-# When cross-compiling, CMAKE_C_COMPILER is the cross compiler (e.g. emcc).
-# We need a native host compiler for minilua and buildvm.
-# Search order: env CC_FOR_BUILD, then common names.
+# ── Find the host C compiler ─────────────────────────────────────────────────
+# IMPORTANT: use CMAKE_HOST_WIN32 (not WIN32) throughout this file.
+# When cross-compiling to Emscripten/WASM, the target is wasm32 so WIN32 is
+# FALSE even though we are running on a Windows host.
 if(DEFINED ENV{CC_FOR_BUILD})
     set(_HOST_CC "$ENV{CC_FOR_BUILD}")
-elseif(WIN32)
-    # On Windows find cl.exe via the VS environment (already initialised by
-    # the parent CMake run) or fall back to clang-cl / gcc.
-    find_program(_HOST_CC_FOUND NAMES cl clang-cl gcc cc)
-    set(_HOST_CC "${_HOST_CC_FOUND}")
+elseif(NOT CMAKE_CROSSCOMPILING)
+    # Native build: the target compiler IS the host compiler.
+    set(_HOST_CC "${CMAKE_C_COMPILER}")
 else()
-    find_program(_HOST_CC_FOUND NAMES gcc clang cc)
+    # Cross-compiling: search for a native host compiler.
+    if(CMAKE_HOST_WIN32)
+        # Prefer cl.exe; check VS env-var path first, then PATH.
+        set(_vc_hints "")
+        if(DEFINED ENV{VCToolsInstallDir})
+            file(TO_CMAKE_PATH "$ENV{VCToolsInstallDir}" _vc_dir)
+            list(APPEND _vc_hints
+                "${_vc_dir}/bin/HostX64/x64"
+                "${_vc_dir}/bin/HostX86/x86")
+        endif()
+        find_program(_HOST_CC_FOUND NAMES cl clang-cl gcc cc
+            HINTS ${_vc_hints})
+    else()
+        find_program(_HOST_CC_FOUND NAMES gcc clang cc)
+    endif()
+    if(NOT _HOST_CC_FOUND)
+        message(FATAL_ERROR
+            "LuaJIT: cannot find a host C compiler for building minilua/buildvm.\n"
+            "Set the CC_FOR_BUILD environment variable to the host compiler path.")
+    endif()
     set(_HOST_CC "${_HOST_CC_FOUND}")
 endif()
+message(STATUS "LuaJIT: host compiler: ${_HOST_CC}")
 
-if(NOT _HOST_CC)
-    message(FATAL_ERROR
-        "LuaJIT: cannot find a host C compiler for building minilua/buildvm.\n"
-        "Set the CC_FOR_BUILD environment variable to the host compiler path.")
-endif()
-message(STATUS "LuaJIT: host compiler for build tools: ${_HOST_CC}")
-
-# ── Simple generator for sub-builds (no Ninja dependency) ────────────────────
-if(WIN32)
-    set(_HOST_GENERATOR "NMake Makefiles")
+# Detect whether the host compiler is MSVC-style (cl.exe / clang-cl).
+get_filename_component(_HOST_CC_BASENAME "${_HOST_CC}" NAME_WE)
+string(TOLOWER "${_HOST_CC_BASENAME}" _HOST_CC_BASENAME)
+if(_HOST_CC_BASENAME STREQUAL "cl" OR _HOST_CC_BASENAME STREQUAL "clang-cl")
+    set(_HOST_CC_IS_MSVC TRUE)
 else()
-    set(_HOST_GENERATOR "Unix Makefiles")
+    set(_HOST_CC_IS_MSVC FALSE)
 endif()
 
-# ── Helper: configure+build a sub-project with the HOST compiler ──────────────
-macro(_host_subbuild NAME BUILD_DIR)
-    execute_process(
-        COMMAND "${CMAKE_COMMAND}" -G "${_HOST_GENERATOR}"
-            "-DCMAKE_C_COMPILER=${_HOST_CC}"
-            "-DCMAKE_BUILD_TYPE=Release"
-            ${ARGN}
-        WORKING_DIRECTORY "${BUILD_DIR}"
-        RESULT_VARIABLE _sub_cfg_result
-        OUTPUT_VARIABLE _sub_cfg_out
-        ERROR_VARIABLE  _sub_cfg_err
-    )
-    if(NOT _sub_cfg_result EQUAL 0)
-        message(FATAL_ERROR
-            "${NAME} configure failed (exit ${_sub_cfg_result})\n"
-            "stdout:\n${_sub_cfg_out}\nstderr:\n${_sub_cfg_err}")
-    endif()
-    execute_process(
-        COMMAND "${CMAKE_COMMAND}" --build "${BUILD_DIR}" --config Release
-        RESULT_VARIABLE _sub_build_result
-        OUTPUT_VARIABLE _sub_build_out
-        ERROR_VARIABLE  _sub_build_err
-    )
-    if(NOT _sub_build_result EQUAL 0)
-        message(FATAL_ERROR
-            "${NAME} build failed (exit ${_sub_build_result})\n"
-            "stdout:\n${_sub_build_out}\nstderr:\n${_sub_build_err}")
-    endif()
-endmacro()
-
-##############################################################################
-# Step A: Build minilua
-##############################################################################
-set(MINILUA_SRC "${LUAJIT_SOURCE_DIR}/host/minilua.c")
-
-if(WIN32)
+# ── Common paths ─────────────────────────────────────────────────────────────
+if(CMAKE_HOST_WIN32)
     set(_host_exe_suffix ".exe")
 else()
     set(_host_exe_suffix "")
 endif()
 
 set(MINILUA_BIN "${CMAKE_CURRENT_BINARY_DIR}/host/minilua${_host_exe_suffix}")
-set(_minilua_build_dir "${CMAKE_CURRENT_BINARY_DIR}/host/minilua_build")
-file(REMOVE_RECURSE "${_minilua_build_dir}")
-file(MAKE_DIRECTORY "${_minilua_build_dir}")
+set(BUILDVM_BIN "${CMAKE_CURRENT_BINARY_DIR}/host/buildvm${_host_exe_suffix}")
+set(DYNASM      "${LUAJIT_DYNASM_DIR}/dynasm.lua")
+
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/host")
 
-file(WRITE "${_minilua_build_dir}/CMakeLists.txt" [=[
-cmake_minimum_required(VERSION 3.20)
-project(minilua C)
-add_executable(minilua "${MINILUA_SRC}")
-if(NOT WIN32)
-    target_link_libraries(minilua PRIVATE m)
-endif()
-foreach(_cfg "" "_DEBUG" "_RELEASE" "_MINSIZEREL" "_RELWITHDEBINFO")
-    set_target_properties(minilua PROPERTIES
-        "RUNTIME_OUTPUT_DIRECTORY${_cfg}" "${OUT_DIR}")
-endforeach()
-]=])
+##############################################################################
+# Step A: Compile minilua directly (no sub-CMake; avoids generator issues)
+##############################################################################
+set(MINILUA_SRC "${LUAJIT_SOURCE_DIR}/host/minilua.c")
+message(STATUS "LuaJIT: compiling minilua...")
 
-message(STATUS "LuaJIT: configuring minilua...")
-_host_subbuild("minilua" "${_minilua_build_dir}"
-    "-DMINILUA_SRC=${MINILUA_SRC}"
-    "-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/host"
-    "${_minilua_build_dir}"
-)
+if(_HOST_CC_IS_MSVC)
+    execute_process(
+        COMMAND "${_HOST_CC}" /nologo /O2 /D_CRT_SECURE_NO_DEPRECATE
+                "${MINILUA_SRC}" "/Fe${MINILUA_BIN}"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/host"
+        RESULT_VARIABLE _mlu_result
+        OUTPUT_VARIABLE _mlu_out
+        ERROR_VARIABLE  _mlu_err
+    )
+else()
+    execute_process(
+        COMMAND "${_HOST_CC}" -O2 -o "${MINILUA_BIN}" "${MINILUA_SRC}" -lm
+        RESULT_VARIABLE _mlu_result
+        OUTPUT_VARIABLE _mlu_out
+        ERROR_VARIABLE  _mlu_err
+    )
+endif()
+if(NOT _mlu_result EQUAL 0)
+    message(FATAL_ERROR
+        "minilua compile failed (exit ${_mlu_result})\n"
+        "stdout:\n${_mlu_out}\nstderr:\n${_mlu_err}")
+endif()
 if(NOT EXISTS "${MINILUA_BIN}")
     message(FATAL_ERROR "minilua binary not found at ${MINILUA_BIN}")
 endif()
 message(STATUS "LuaJIT: minilua -> ${MINILUA_BIN}")
 
 ##############################################################################
-# Step B: Generate luajit.h FIRST (buildvm #includes it)
+# Step B: Generate luajit.h
+#
+# genversion.lua opens its input files by relative path from CWD.  Pass
+# explicit absolute paths as positional arguments so it works regardless of
+# the working directory.
 ##############################################################################
-set(DYNASM    "${LUAJIT_DYNASM_DIR}/dynasm.lua")
 set(LJ_LUAJIT_H "${CMAKE_CURRENT_BINARY_DIR}/luajit.h")
+set(_relver_txt "${CMAKE_CURRENT_BINARY_DIR}/luajit_relver.txt")
+
+# Produce luajit_relver.txt from the git commit timestamp.
+find_program(_git_exe git)
+if(_git_exe)
+    execute_process(
+        COMMAND "${_git_exe}" show -s "--format=%ct"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        RESULT_VARIABLE  _git_rv
+        OUTPUT_VARIABLE  _git_out
+        ERROR_QUIET
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    if(_git_rv EQUAL 0 AND _git_out MATCHES "^[0-9]+$")
+        file(WRITE "${_relver_txt}" "${_git_out}\n")
+    endif()
+endif()
+if(NOT EXISTS "${_relver_txt}")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.relver")
+        file(READ "${CMAKE_CURRENT_SOURCE_DIR}/.relver" _relver_content)
+        file(WRITE "${_relver_txt}" "${_relver_content}")
+    else()
+        file(WRITE "${_relver_txt}" "ROLLING\n")
+    endif()
+endif()
 
 execute_process(
-    COMMAND "${MINILUA_BIN}" "${LUAJIT_SOURCE_DIR}/host/genversion.lua"
-    WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+    COMMAND "${MINILUA_BIN}"
+            "${LUAJIT_SOURCE_DIR}/host/genversion.lua"
+            "${LUAJIT_SOURCE_DIR}/luajit_rolling.h"
+            "${_relver_txt}"
+            "${LJ_LUAJIT_H}"
     RESULT_VARIABLE _ver_result
     OUTPUT_VARIABLE _ver_out
     ERROR_VARIABLE  _ver_err
@@ -127,14 +157,14 @@ endif()
 message(STATUS "LuaJIT: generated luajit.h")
 
 ##############################################################################
-# Step C: Probe target architecture via #pragma message (stderr)
+# Step C: Probe target architecture via #pragma message (stderr / stdout)
 #
-# #pragma message() writes to stderr on GCC and Clang.
-# On MSVC it writes to stdout in the form:  filename.c\nmessage-text
-# So we capture BOTH streams and search both.
+# Uses CMAKE_C_COMPILER (the TARGET compiler) so the probe reflects the real
+# target ABI.  Skipped for WASM — arch is fixed to x86/wasm32 below.
 ##############################################################################
-set(_arch_probe_src "${CMAKE_CURRENT_BINARY_DIR}/host/_arch_probe.c")
-file(WRITE "${_arch_probe_src}" [=[
+if(NOT LUAJIT_TARGET_WASM)
+    set(_arch_probe_src "${CMAKE_CURRENT_BINARY_DIR}/host/_arch_probe.c")
+    file(WRITE "${_arch_probe_src}" [=[
 #include "lj_arch.h"
 #if LJ_TARGET_X64
 #pragma message("LUAJIT_PROBE: LJ_TARGET_X64")
@@ -231,34 +261,31 @@ file(WRITE "${_arch_probe_src}" [=[
 #endif
 ]=])
 
-# Use the TARGET compiler for the probe (we want the target arch, not the host).
-# For Emscripten CMAKE_C_COMPILER is emcc — that's correct here.
-if(MSVC)
-    execute_process(
-        COMMAND "${CMAKE_C_COMPILER}" /nologo /EP /D_BUILDVM_H
-            "/I${LUAJIT_SOURCE_DIR}" "${_arch_probe_src}"
-        OUTPUT_VARIABLE _probe_stdout
-        ERROR_VARIABLE  _probe_stderr
-        RESULT_VARIABLE _probe_result
-    )
-    # MSVC #pragma message goes to stdout (mixed with expanded source).
-    set(_arch_defines "${_probe_stdout}\n${_probe_stderr}")
-else()
-    execute_process(
-        COMMAND "${CMAKE_C_COMPILER}" -E -D_BUILDVM_H
-            "-I${LUAJIT_SOURCE_DIR}" "${_arch_probe_src}"
-        OUTPUT_VARIABLE _probe_stdout
-        ERROR_VARIABLE  _probe_stderr
-        RESULT_VARIABLE _probe_result
-    )
-    # GCC/Clang #pragma message goes to stderr.
-    set(_arch_defines "${_probe_stderr}\n${_probe_stdout}")
-endif()
+    if(MSVC)
+        execute_process(
+            COMMAND "${CMAKE_C_COMPILER}" /nologo /EP /D_BUILDVM_H
+                    "/I${LUAJIT_SOURCE_DIR}" "${_arch_probe_src}"
+            OUTPUT_VARIABLE _probe_stdout
+            ERROR_VARIABLE  _probe_stderr
+            RESULT_VARIABLE _probe_result
+        )
+        set(_arch_defines "${_probe_stdout}\n${_probe_stderr}")
+    else()
+        execute_process(
+            COMMAND "${CMAKE_C_COMPILER}" -E -D_BUILDVM_H
+                    "-I${LUAJIT_SOURCE_DIR}" "${_arch_probe_src}"
+            OUTPUT_VARIABLE _probe_stdout
+            ERROR_VARIABLE  _probe_stderr
+            RESULT_VARIABLE _probe_result
+        )
+        set(_arch_defines "${_probe_stderr}\n${_probe_stdout}")
+    endif()
 
-if(NOT _probe_result EQUAL 0)
-    message(FATAL_ERROR
-        "Architecture probe failed (exit ${_probe_result})\n"
-        "stderr:\n${_probe_stderr}")
+    if(NOT _probe_result EQUAL 0)
+        message(FATAL_ERROR
+            "Architecture probe failed (exit ${_probe_result})\n"
+            "stderr:\n${_probe_stderr}")
+    endif()
 endif()
 
 macro(_probe_has VAR MARKER)
@@ -269,16 +296,8 @@ macro(_probe_has VAR MARKER)
     endif()
 endmacro()
 
-set(_arch_version 0)
-foreach(_v 80 70 61 60 51 50 40 20 10 0)
-    if(_arch_defines MATCHES "LUAJIT_PROBE: LJ_ARCH_VERSION_${_v}")
-        set(_arch_version "${_v}")
-        break()
-    endif()
-endforeach()
-
 ##############################################################################
-# Step D: Determine DASM arch + flags
+# Step D: Determine DynASM arch + flags
 ##############################################################################
 set(DASM_AFLAGS "")
 set(DASM_ARCH   "")
@@ -346,6 +365,14 @@ else()
     _probe_has(_round     "LJ_ARCH_ROUND")
     _probe_has(_ppc32on64 "LJ_ARCH_PPC32ON64")
 
+    set(_arch_version 0)
+    foreach(_v 80 70 61 60 51 50 40 20 10 0)
+        if(_arch_defines MATCHES "LUAJIT_PROBE: LJ_ARCH_VERSION_${_v}")
+            set(_arch_version "${_v}")
+            break()
+        endif()
+    endforeach()
+
     if(_le)
         list(APPEND DASM_AFLAGS -D ENDIAN_LE)
     else()
@@ -408,7 +435,7 @@ if(NOT EXISTS "${DASM_DASC}")
 endif()
 
 ##############################################################################
-# Step E: Run DynASM -> host/buildvm_arch.h
+# Step E: Run DynASM → host/buildvm_arch.h
 ##############################################################################
 set(BUILDVM_ARCH_H "${CMAKE_CURRENT_BINARY_DIR}/host/buildvm_arch.h")
 
@@ -428,8 +455,10 @@ endif()
 message(STATUS "LuaJIT: buildvm_arch.h generated")
 
 ##############################################################################
-# Step F: Build buildvm
-# Include both the source dir AND the binary dir so buildvm finds luajit.h
+# Step F: Compile buildvm directly
+#
+# buildvm.c includes luajit.h (from binary dir) and buildvm_arch.h
+# (from binary dir/host), so both must be in the include path.
 ##############################################################################
 set(BUILDVM_SRCS
     "${LUAJIT_SOURCE_DIR}/host/buildvm.c"
@@ -438,42 +467,47 @@ set(BUILDVM_SRCS
     "${LUAJIT_SOURCE_DIR}/host/buildvm_lib.c"
     "${LUAJIT_SOURCE_DIR}/host/buildvm_fold.c"
 )
-set(BUILDVM_BIN "${CMAKE_CURRENT_BINARY_DIR}/host/buildvm${_host_exe_suffix}")
-set(_buildvm_build_dir "${CMAKE_CURRENT_BINARY_DIR}/host/buildvm_build")
-file(REMOVE_RECURSE "${_buildvm_build_dir}")
-file(MAKE_DIRECTORY "${_buildvm_build_dir}")
 
-file(WRITE "${_buildvm_build_dir}/CMakeLists.txt" [=[
-cmake_minimum_required(VERSION 3.20)
-project(buildvm C)
-add_executable(buildvm ${BUILDVM_SRCS})
-target_include_directories(buildvm PRIVATE
-    "${LUAJIT_SRC_DIR}"
-    "${ARCH_H_DIR}"
-    "${GENERATED_DIR}")   # <-- for luajit.h
-target_compile_definitions(buildvm PRIVATE _BUILDVM_H)
-foreach(_cfg "" "_DEBUG" "_RELEASE" "_MINSIZEREL" "_RELWITHDEBINFO")
-    set_target_properties(buildvm PROPERTIES
-        "RUNTIME_OUTPUT_DIRECTORY${_cfg}" "${OUT_DIR}")
-endforeach()
-]=])
-
-message(STATUS "LuaJIT: configuring buildvm...")
-_host_subbuild("buildvm" "${_buildvm_build_dir}"
-    "-DBUILDVM_SRCS=${BUILDVM_SRCS}"
-    "-DLUAJIT_SRC_DIR=${LUAJIT_SOURCE_DIR}"
-    "-DARCH_H_DIR=${CMAKE_CURRENT_BINARY_DIR}/host"
-    "-DGENERATED_DIR=${CMAKE_CURRENT_BINARY_DIR}"
-    "-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/host"
-    "${_buildvm_build_dir}"
-)
+message(STATUS "LuaJIT: compiling buildvm...")
+if(_HOST_CC_IS_MSVC)
+    execute_process(
+        COMMAND "${_HOST_CC}" /nologo /O2 /D_CRT_SECURE_NO_DEPRECATE
+                /D_BUILDVM_H
+                "/I${LUAJIT_SOURCE_DIR}"
+                "/I${CMAKE_CURRENT_BINARY_DIR}/host"
+                "/I${CMAKE_CURRENT_BINARY_DIR}"
+                ${BUILDVM_SRCS}
+                "/Fe${BUILDVM_BIN}"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/host"
+        RESULT_VARIABLE _bvm_result
+        OUTPUT_VARIABLE _bvm_out
+        ERROR_VARIABLE  _bvm_err
+    )
+else()
+    execute_process(
+        COMMAND "${_HOST_CC}" -O2 -D_BUILDVM_H
+                "-I${LUAJIT_SOURCE_DIR}"
+                "-I${CMAKE_CURRENT_BINARY_DIR}/host"
+                "-I${CMAKE_CURRENT_BINARY_DIR}"
+                ${BUILDVM_SRCS}
+                -o "${BUILDVM_BIN}" -lm
+        RESULT_VARIABLE _bvm_result
+        OUTPUT_VARIABLE _bvm_out
+        ERROR_VARIABLE  _bvm_err
+    )
+endif()
+if(NOT _bvm_result EQUAL 0)
+    message(FATAL_ERROR
+        "buildvm compile failed (exit ${_bvm_result})\n"
+        "stdout:\n${_bvm_out}\nstderr:\n${_bvm_err}")
+endif()
 if(NOT EXISTS "${BUILDVM_BIN}")
     message(FATAL_ERROR "buildvm binary not found at ${BUILDVM_BIN}")
 endif()
 message(STATUS "LuaJIT: buildvm -> ${BUILDVM_BIN}")
 
 ##############################################################################
-# Step G: Generate remaining headers via buildvm
+# Step G: Generate headers via buildvm
 ##############################################################################
 set(LJLIB_C
     "${LUAJIT_SOURCE_DIR}/lib_base.c"
@@ -493,14 +527,14 @@ set(LJLIB_C
 macro(_buildvm_run MODE OUTPUT)
     execute_process(
         COMMAND "${BUILDVM_BIN}" -m "${MODE}" -o "${OUTPUT}" ${ARGN}
-        RESULT_VARIABLE _bvm_result
-        OUTPUT_VARIABLE _bvm_out
-        ERROR_VARIABLE  _bvm_err
+        RESULT_VARIABLE _bvm_run_result
+        OUTPUT_VARIABLE _bvm_run_out
+        ERROR_VARIABLE  _bvm_run_err
     )
-    if(NOT _bvm_result EQUAL 0)
+    if(NOT _bvm_run_result EQUAL 0)
         message(FATAL_ERROR
-            "buildvm -m ${MODE} failed (exit ${_bvm_result})\n"
-            "stdout:\n${_bvm_out}\nstderr:\n${_bvm_err}")
+            "buildvm -m ${MODE} failed (exit ${_bvm_run_result})\n"
+            "stdout:\n${_bvm_run_out}\nstderr:\n${_bvm_run_err}")
     endif()
     message(STATUS "LuaJIT: generated ${OUTPUT}")
 endmacro()
@@ -522,7 +556,7 @@ _buildvm_run(vmdef   "${LJ_VMDEF_LUA}" ${LJLIB_C})
 _buildvm_run(folddef "${LJ_FOLDDEF_H}" "${LUAJIT_SOURCE_DIR}/lj_opt_fold.c")
 
 ##############################################################################
-# Step H: lj_vm.S / lj_vm.obj
+# Step H: lj_vm.S / lj_vm.obj  (skipped for WASM)
 ##############################################################################
 if(NOT LUAJIT_TARGET_WASM)
     if(WIN32)
